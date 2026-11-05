@@ -37,7 +37,7 @@ PORT = int(os.environ.get("PORT", "10000"))
 # Публичный адрес сервиса на Render (Render сам задаёт RENDER_EXTERNAL_URL для Web Service)
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
 
-IMAGE_URL = "https://i.imgur.com/IaYKoqn.jpeg"
+IMAGE_URL = "https://cdn.phototourl.com/member/2026-11-05-c7d7d24c-9b58-49cf-b7a6-450335ed6b9e.png"
 PREVIEW = LinkPreviewOptions(url=IMAGE_URL, show_above_text=True, prefer_large_media=True)
 
 TZ = ZoneInfo("Europe/Moscow")
