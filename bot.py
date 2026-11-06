@@ -1,18 +1,15 @@
 import asyncio
-import hashlib
-import hmac
-import json
 import logging
 import os
 import time
 from datetime import datetime, timedelta
-from urllib.parse import parse_qsl
 from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import CommandStart
 from aiogram.types import (
     ChosenInlineResult,
@@ -24,7 +21,6 @@ from aiogram.types import (
     InputTextMessageContent,
     LinkPreviewOptions,
     Message,
-    WebAppInfo,
 )
 from aiohttp import web
 
@@ -34,66 +30,142 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 PORT = int(os.environ.get("PORT", "10000"))
-# Публичный адрес сервиса на Render (Render сам задаёт RENDER_EXTERNAL_URL для Web Service)
 PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+# Премиум-эмодзи в кнопках канала работают, только если у бота куплен доп. юзернейм на Fragment.
+# Если купишь — поставь переменную CHANNEL_BUTTON_ICONS=1
+CHANNEL_BUTTON_ICONS = os.environ.get("CHANNEL_BUTTON_ICONS", "0") == "1"
 
 IMAGE_URL = "https://cdn.phototourl.com/member/2026-11-05-c7d7d24c-9b58-49cf-b7a6-450335ed6b9e.png"
 PREVIEW = LinkPreviewOptions(url=IMAGE_URL, show_above_text=True, prefer_large_media=True)
 
 TZ = ZoneInfo("Europe/Moscow")
 POST_EVERY_MINUTES = 30
-USER_COOLDOWN = 5 * 60
-CACHE_TTL = 60
-SHARE_TEXT_MAX_AGE = 10 * 60
+MAX_POST_LATE = 5 * 60     # если проспали слот больше чем на 5 минут — слот пропускаем
+USER_COOLDOWN = 5 * 60     # лимит: бот и инлайн — каждый отдельно, раз в 5 минут
+RATES_REFRESH = 60         # как часто обновляем курс в фоне (сек)
+RATES_FRESH = 120          # курс младше этого возраста отдаём сразу
+RATES_STALE_MAX = 30 * 60  # если API недоступны, можно показать курс не старше 30 минут
+KEEPALIVE_EVERY = 240      # самопинг, чтобы бесплатный Render не засыпал
+
+# premium-эмодзи кнопок
+BTN_VIEW_EMOJI = "5276412364458059956"   # 🕓
+BTN_SHARE_EMOJI = "5278305362703835500"  # 🔗
 
 COINS = [
-    ("USDT", "tether", "5192942020112442148"),
-    ("GRAM (ранее Ton)", "the-open-network", "5193179982775476271"),
-    ("BTC", "bitcoin", "5193059508942824703"),
-    ("ETH", "ethereum", "5195352119535755156"),
-    ("SOL", "solana", "5193144965907110821"),
-    ("BNB", "binancecoin", "5193131612853789713"),
-    ("USDC", "usd-coin", "5193004361562745352"),
-    ("TRX", "tron", "5193193288584158951"),
+    {"label": "USDT", "cg": ["tether"], "cc": ["USDT"], "emoji": "5192942020112442148"},
+    # TON переименован в GRAM, на CoinGecko id теперь "gram"; старый оставлен про запас
+    {"label": "GRAM (ранее Ton)", "cg": ["gram", "the-open-network"], "cc": ["GRAM", "TON"], "emoji": "5193179982775476271"},
+    {"label": "BTC", "cg": ["bitcoin"], "cc": ["BTC"], "emoji": "5193059508942824703"},
+    {"label": "ETH", "cg": ["ethereum"], "cc": ["ETH"], "emoji": "5195352119535755156"},
+    {"label": "SOL", "cg": ["solana"], "cc": ["SOL"], "emoji": "5193144965907110821"},
+    {"label": "BNB", "cg": ["binancecoin"], "cc": ["BNB"], "emoji": "5193131612853789713"},
+    {"label": "USDC", "cg": ["usd-coin"], "cc": ["USDC"], "emoji": "5193004361562745352"},
+    {"label": "TRX", "cg": ["tron"], "cc": ["TRX"], "emoji": "5193193288584158951"},
 ]
 
-API_URL = "https://api.coingecko.com/api/v3/simple/price"
+CG_URL = "https://api.coingecko.com/api/v3/simple/price"
+CC_URL = "https://min-api.cryptocompare.com/data/pricemultifull"
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CryptoExzoBot/1.0)"}
 
 # ---------- Состояние ----------
 bot_username = ""
-last_request: dict[int, float] = {}
-last_text: dict[int, tuple[float, str]] = {}
-_cache: tuple[float, dict] | None = None
-_lock = asyncio.Lock()
+last_view: dict[int, float] = {}    # лимит просмотра в личке бота
+last_inline: dict[int, float] = {}  # лимит инлайна (и «Поделиться»)
+rates: dict = {"data": {}, "ts": 0.0}
+_rates_lock = asyncio.Lock()
+_tasks: set = set()
 
 
+# ---------- Курсы ----------
+async def fetch_coingecko(session: aiohttp.ClientSession) -> dict:
+    ids = sorted({i for c in COINS for i in c["cg"]})
+    params = {"ids": ",".join(ids), "vs_currencies": "usd,rub", "include_24hr_change": "true"}
+    async with session.get(CG_URL, params=params) as r:
+        r.raise_for_status()
+        raw = await r.json()
+    out = {}
+    for c in COINS:
+        for cid in c["cg"]:
+            info = raw.get(cid)
+            if info and info.get("usd") is not None:
+                out[c["label"]] = {
+                    "usd": float(info["usd"]),
+                    "rub": float(info["rub"]) if info.get("rub") is not None else None,
+                    "chg": float(info.get("usd_24h_change") or 0.0),
+                }
+                break
+    return out
+
+
+async def fetch_cryptocompare(session: aiohttp.ClientSession) -> dict:
+    syms = sorted({s for c in COINS for s in c["cc"]})
+    params = {"fsyms": ",".join(syms), "tsyms": "USD,RUB"}
+    async with session.get(CC_URL, params=params) as r:
+        r.raise_for_status()
+        raw = (await r.json()).get("RAW", {})
+    out = {}
+    for c in COINS:
+        for sym in c["cc"]:
+            row = raw.get(sym)
+            if row and row.get("USD", {}).get("PRICE") is not None:
+                rub = row.get("RUB", {}).get("PRICE")
+                out[c["label"]] = {
+                    "usd": float(row["USD"]["PRICE"]),
+                    "rub": float(rub) if rub is not None else None,
+                    "chg": float(row["USD"].get("CHANGEPCT24HOUR") or 0.0),
+                }
+                break
+    return out
+
+
+async def refresh_rates() -> bool:
+    """Обновляет кэш курса: CoinGecko, а чего не хватает — добирает из CryptoCompare."""
+    async with _rates_lock:
+        if time.monotonic() - rates["ts"] < 5:  # только что обновляли
+            return True
+        data: dict = {}
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout, headers=HTTP_HEADERS) as session:
+            for name, fn in (("coingecko", fetch_coingecko), ("cryptocompare", fetch_cryptocompare)):
+                try:
+                    part = await fn(session)
+                except Exception as e:
+                    logging.warning("%s error: %s", name, e)
+                    continue
+                for label, value in part.items():
+                    data.setdefault(label, value)
+                if len(data) == len(COINS):
+                    break
+        if not data:
+            return False
+        rates["data"] = {**rates["data"], **data}
+        rates["ts"] = time.monotonic()
+        return True
+
+
+async def get_rates() -> dict:
+    age = time.monotonic() - rates["ts"]
+    if rates["data"] and age < RATES_FRESH:
+        return rates["data"]
+    await refresh_rates()
+    age = time.monotonic() - rates["ts"]
+    if rates["data"] and age < RATES_STALE_MAX:
+        return rates["data"]
+    raise RuntimeError("Курс недоступен")
+
+
+async def rates_updater():
+    while True:
+        try:
+            await refresh_rates()
+        except Exception:
+            logging.exception("rates_updater error")
+        await asyncio.sleep(RATES_REFRESH)
+
+
+# ---------- Сообщение ----------
 def emoji(eid: str, fallback: str) -> str:
     return f"<tg-emoji emoji-id='{eid}'>{fallback}</tg-emoji>"
-
-
-async def fetch_rates() -> dict:
-    global _cache
-    async with _lock:
-        if _cache and time.monotonic() - _cache[0] < CACHE_TTL:
-            return _cache[1]
-        params = {
-            "ids": ",".join(c[1] for c in COINS),
-            "vs_currencies": "usd,rub",
-            "include_24hr_change": "true",
-        }
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            for attempt in range(3):
-                try:
-                    async with session.get(API_URL, params=params) as r:
-                        r.raise_for_status()
-                        data = await r.json()
-                    _cache = (time.monotonic(), data)
-                    return data
-                except Exception as e:
-                    logging.warning("CoinGecko error (try %s): %s", attempt + 1, e)
-                    await asyncio.sleep(2 * (attempt + 1))
-        raise RuntimeError("Не удалось получить курс")
 
 
 def fmt_price(value: float, symbol: str) -> str:
@@ -103,7 +175,7 @@ def fmt_price(value: float, symbol: str) -> str:
 
 
 async def build_message(when: datetime | None = None) -> str:
-    data = await fetch_rates()
+    data = await get_rates()
     now = when or datetime.now(TZ)
 
     lines = [
@@ -112,80 +184,104 @@ async def build_message(when: datetime | None = None) -> str:
         "",
     ]
 
-    for label, cg_id, coin_emoji in COINS:
-        info = data.get(cg_id)
-        if not info or "usd" not in info:
+    for c in COINS:
+        info = data.get(c["label"])
+        if not info:
+            logging.warning("No data for %s", c["label"])
             continue
-        usd = info["usd"]
-        rub = info.get("rub")
-        change = info.get("usd_24h_change") or 0.0
+        change = info["chg"]
+        arrow = emoji("5206401524200145033", "🔼") if change >= 0 else emoji("5206510891247371052", "🔽")
 
-        if change >= 0:
-            arrow = emoji("5206401524200145033", "🔼")
-        else:
-            arrow = emoji("5206510891247371052", "🔽")
-
-        price = f"{emoji('5255933397750014894', '💱')} {fmt_price(usd, '$')}"
-        if rub is not None:
-            price += f" &amp; {emoji('5255806447106679302', '💱')} {fmt_price(rub, '₽')}"
+        price = f"{emoji('5255933397750014894', '💱')} {fmt_price(info['usd'], '$')}"
+        if info["rub"] is not None:
+            price += f" &amp; {emoji('5255806447106679302', '💱')} {fmt_price(info['rub'], '₽')}"
 
         lines.append(
-            f"{emoji(coin_emoji, '🪙')} <b>1 {label}</b>: {price} | {arrow} <b>{abs(change):.2f}%</b>"
+            f"{emoji(c['emoji'], '🪙')} <b>1 {c['label']}</b>: {price} | {arrow} <b>{abs(change):.2f}%</b>"
         )
 
     lines += ["", '<a href="https://t.me/cryptoexzo">Курс криптовалюты CryptoExzo</a>']
     return "\n".join(lines)
 
 
-# ---------- Клавиатуры ----------
-def view_button() -> InlineKeyboardButton:
-    return InlineKeyboardButton(
-        text="🕓 Просмотреть курс на данный момент",
-        url=f"https://t.me/{bot_username}?start=rates",
-    )
+# ---------- Кнопки ----------
+def view_button(icons: bool) -> InlineKeyboardButton:
+    url = f"https://t.me/{bot_username}?start=rates"
+    if icons:
+        return InlineKeyboardButton(
+            text="Просмотреть курс на данный момент", icon_custom_emoji_id=BTN_VIEW_EMOJI, url=url
+        )
+    return InlineKeyboardButton(text="🕓 Просмотреть курс на данный момент", url=url)
 
 
-def share_button() -> InlineKeyboardButton:
-    text = "🔗 Поделиться этим курсом"
-    if PUBLIC_URL:
-        # Mini App, который сразу открывает окно «via @bot + предпросмотр + кому отправить»
-        return InlineKeyboardButton(text=text, web_app=WebAppInfo(url=f"{PUBLIC_URL}/share"))
-    # запасной вариант, если публичного адреса нет
-    return InlineKeyboardButton(text=text, switch_inline_query="")
+def share_button(icons: bool) -> InlineKeyboardButton:
+    # Выбор чата -> в поле ввода подставляется @бот, внизу появляется «Отправить текущий курс»
+    if icons:
+        return InlineKeyboardButton(
+            text="Поделиться этим курсом", icon_custom_emoji_id=BTN_SHARE_EMOJI, switch_inline_query=""
+        )
+    return InlineKeyboardButton(text="🔗 Поделиться этим курсом", switch_inline_query="")
 
 
-def kb_public() -> InlineKeyboardMarkup:
-    """Для канала, inline-сообщений и пересылаемых сообщений."""
-    return InlineKeyboardMarkup(inline_keyboard=[[view_button()]])
+def kb_public(icons: bool) -> InlineKeyboardMarkup:
+    """Канал и сообщения, отправленные через инлайн."""
+    return InlineKeyboardMarkup(inline_keyboard=[[view_button(icons)]])
 
 
-def kb_private() -> InlineKeyboardMarkup:
-    """Для ответа в личке бота."""
-    return InlineKeyboardMarkup(inline_keyboard=[[view_button()], [share_button()]])
+def kb_private(icons: bool) -> InlineKeyboardMarkup:
+    """Ответ в личке бота."""
+    return InlineKeyboardMarkup(inline_keyboard=[[view_button(icons)], [share_button(icons)]])
+
+
+# ---------- Отправка ----------
+async def send_rates(bot: Bot, chat_id: int, text: str, private: bool, icons: bool):
+    """Отправка с повторами. Если Telegram не принял иконки в кнопках — шлём с обычными эмодзи."""
+    make_kb = kb_private if private else kb_public
+    last_error: Exception | None = None
+    for attempt in range(4):
+        try:
+            return await bot.send_message(
+                chat_id, text, reply_markup=make_kb(icons), link_preview_options=PREVIEW
+            )
+        except TelegramRetryAfter as e:
+            last_error = e
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramBadRequest as e:
+            last_error = e
+            if icons:
+                logging.warning("Иконки в кнопках не приняты (%s) — отправляю без них", e)
+                icons = False
+            else:
+                raise
+        except TelegramNetworkError as e:
+            last_error = e
+            await asyncio.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"Не удалось отправить сообщение: {last_error}")
+
+
+def cooldown_left(store: dict, uid: int) -> float:
+    return USER_COOLDOWN - (time.monotonic() - store.get(uid, -1e9))
+
+
+def fmt_left(left: float) -> str:
+    m, s = divmod(int(left) + 1, 60)
+    return f"{m} мин {s} сек"
 
 
 def make_result(text: str) -> InlineQueryResultArticle:
+    now = datetime.now(TZ)
     return InlineQueryResultArticle(
         id="rates",
-        title="Показать текущий курс",
-        description="Отправить актуальный курс криптовалюты",
+        title="Отправить текущий курс",
+        description=f"Актуальный курс криптовалюты на {now:%H:%M} по МСК",
         thumbnail_url=IMAGE_URL,
         input_message_content=InputTextMessageContent(
             message_text=text,
             parse_mode=ParseMode.HTML,
             link_preview_options=PREVIEW,
         ),
-        reply_markup=kb_public(),
+        reply_markup=kb_public(icons=False),
     )
-
-
-def cooldown_left(uid: int) -> float:
-    return USER_COOLDOWN - (time.monotonic() - last_request.get(uid, -1e9))
-
-
-def fmt_left(left: float) -> str:
-    m, s = divmod(int(left) + 1, 60)
-    return f"{m} мин {s} сек"
 
 
 # ---------- Хендлеры ----------
@@ -195,7 +291,7 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def on_start(message: Message):
     uid = message.from_user.id
-    left = cooldown_left(uid)
+    left = cooldown_left(last_view, uid)
     if left > 0:
         await message.answer(
             f"⏳ Курс можно просматривать раз в 5 минут. Попробуйте снова через {fmt_left(left)}."
@@ -203,19 +299,18 @@ async def on_start(message: Message):
         return
     try:
         text = await build_message()
+        await send_rates(message.bot, message.chat.id, text, private=True, icons=True)
     except Exception:
-        logging.exception("build_message failed")
-        await message.answer("⚠️ Не удалось получить курс, попробуйте чуть позже.")
+        logging.exception("DM reply failed")
+        await message.answer("⚠️ Не удалось получить курс, попробуйте через минуту.")
         return
-    last_request[uid] = time.monotonic()
-    last_text[uid] = (time.monotonic(), text)
-    await message.answer(text, reply_markup=kb_private(), link_preview_options=PREVIEW)
+    last_view[uid] = time.monotonic()
 
 
 @dp.inline_query()
 async def on_inline(query: InlineQuery):
     uid = query.from_user.id
-    left = cooldown_left(uid)
+    left = cooldown_left(last_inline, uid)
     if left > 0:
         await query.answer(
             [],
@@ -228,145 +323,111 @@ async def on_inline(query: InlineQuery):
         return
     try:
         text = await build_message()
+        await query.answer([make_result(text)], cache_time=0, is_personal=True)
     except Exception:
-        logging.exception("inline build failed")
-        await query.answer(
-            [],
-            cache_time=0,
-            is_personal=True,
-            button=InlineQueryResultsButton(
-                text="⚠️ Не удалось получить курс", start_parameter="error"
-            ),
-        )
-        return
-    await query.answer([make_result(text)], cache_time=0, is_personal=True)
+        logging.exception("Inline answer failed")
+        try:
+            await query.answer(
+                [],
+                cache_time=0,
+                is_personal=True,
+                button=InlineQueryResultsButton(
+                    text="⚠️ Курс недоступен, попробуйте позже", start_parameter="error"
+                ),
+            )
+        except Exception:
+            pass
 
 
 @dp.chosen_inline_result()
 async def on_chosen(chosen: ChosenInlineResult):
-    # лимит 5 минут включается, когда человек реально отправил курс
-    # (нужно включить /setinlinefeedback в BotFather)
-    last_request[chosen.from_user.id] = time.monotonic()
+    # Лимит включается, когда человек реально отправил курс.
+    # Нужно включить /setinlinefeedback (100%) в BotFather.
+    last_inline[chosen.from_user.id] = time.monotonic()
 
 
 # ---------- Автопост в канал ----------
 def next_slot(after: datetime) -> datetime:
-    """Ближайшее время строго после `after`: 00:00, 00:30, 01:00 ... 23:30 по МСК."""
+    """Ближайшее время строго после `after`: 00:00, 00:30, ... 23:30 по МСК."""
     slot = after.replace(minute=0, second=0, microsecond=0)
     while slot <= after:
         slot += timedelta(minutes=POST_EVERY_MINUTES)
     return slot
 
 
+async def wait_until(target: datetime, early: float = 0.0):
+    while True:
+        delay = (target - datetime.now(TZ)).total_seconds() - early
+        if delay <= 0:
+            return
+        await asyncio.sleep(min(delay, 20))
+
+
 async def scheduler(bot: Bot):
     target = next_slot(datetime.now(TZ))
-    logging.info("Next channel post at %s MSK", target.strftime("%H:%M"))
+    logging.info("Следующий пост в канал: %s МСК", target.strftime("%H:%M"))
     while True:
-        # ждём короткими шагами, чтобы пост не вышел чуть раньше времени
-        while True:
-            delay = (target - datetime.now(TZ)).total_seconds()
-            if delay <= 0:
-                break
-            await asyncio.sleep(min(delay, 30))
-        try:
-            # в сообщении всегда стоит ровно время слота (например 12:30), а не 12:29
-            text = await build_message(when=target)
-            await bot.send_message(
-                CHANNEL_ID, text, reply_markup=kb_public(), link_preview_options=PREVIEW
-            )
-            logging.info("Posted to channel at %s MSK", target.strftime("%H:%M"))
-        except Exception:
-            logging.exception("Channel post failed")
+        await wait_until(target, early=6)
+        try:  # свежий курс прямо перед постом
+            await asyncio.wait_for(refresh_rates(), timeout=10)
+        except Exception as e:
+            logging.warning("Не удалось обновить курс перед постом: %s", e)
+        await wait_until(target)
+
+        late = (datetime.now(TZ) - target).total_seconds()
+        if late > MAX_POST_LATE:
+            logging.warning("Слот %s пропущен: опоздание %.0f сек", target.strftime("%H:%M"), late)
+        else:
+            try:
+                text = await build_message(when=target)
+                await send_rates(bot, CHANNEL_ID, text, private=False, icons=CHANNEL_BUTTON_ICONS)
+                logging.info("Пост в канал %s МСК отправлен (опоздание %.1f сек)", target.strftime("%H:%M"), late)
+            except Exception:
+                logging.exception("Пост в канал не отправлен")
         target = next_slot(max(datetime.now(TZ), target))
 
 
-# ---------- Web: health + Mini App для кнопки «Поделиться» ----------
-SHARE_HTML = """<!doctype html>
-<html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-</head>
-<body style="font-family:sans-serif;text-align:center;padding:40px;color:#888">
-<div id="m">Загрузка…</div>
-<script>
-const tg = Telegram.WebApp;
-tg.ready();
-(async () => {
-  try {
-    const r = await fetch('/api/prepare', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({initData: tg.initData})
-    });
-    const d = await r.json();
-    if (!d.id) throw new Error('no id');
-    tg.shareMessage(d.id, () => tg.close());
-  } catch (e) {
-    document.getElementById('m').textContent = 'Не удалось. Попробуйте позже.';
-    setTimeout(() => tg.close(), 1500);
-  }
-})();
-</script>
-</body></html>"""
+# ---------- Служебное ----------
+async def keepalive():
+    """Раз в 4 минуты стучимся на свой публичный адрес, чтобы бесплатный Render не засыпал."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(PUBLIC_URL + "/") as r:
+                    await r.read()
+        except Exception as e:
+            logging.warning("keepalive error: %s", e)
+        await asyncio.sleep(KEEPALIVE_EVERY)
 
 
-def check_init_data(init_data: str) -> int | None:
-    parsed = dict(parse_qsl(init_data, keep_blank_values=True))
-    received_hash = parsed.pop("hash", None)
-    if not received_hash:
-        return None
-    check = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
-    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-    calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calc, received_hash):
-        return None
-    if time.time() - int(parsed.get("auth_date", "0")) > 3600:
-        return None
-    return int(json.loads(parsed["user"])["id"])
+async def supervise(name: str, fn, *args):
+    """Если фоновая задача упала — перезапускаем, чтобы она никогда не останавливалась."""
+    while True:
+        try:
+            await fn(*args)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("%s упала, перезапуск через 5 сек", name)
+            await asyncio.sleep(5)
+
+
+def spawn(name: str, fn, *args):
+    task = asyncio.create_task(supervise(name, fn, *args))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
 
 
 async def h_health(request: web.Request):
     return web.Response(text="ok")
 
 
-async def h_share(request: web.Request):
-    return web.Response(text=SHARE_HTML, content_type="text/html")
-
-
-async def h_prepare(request: web.Request):
-    bot: Bot = request.app["bot"]
-    try:
-        body = await request.json()
-        uid = check_init_data(body.get("initData", ""))
-        if not uid:
-            return web.json_response({"error": "auth"}, status=403)
-
-        saved = last_text.get(uid)
-        if saved and time.monotonic() - saved[0] < SHARE_TEXT_MAX_AGE:
-            text = saved[1]  # делимся именно тем курсом, который человек видел
-        else:
-            text = await build_message()
-
-        prepared = await bot.save_prepared_inline_message(
-            user_id=uid,
-            result=make_result(text),
-            allow_user_chats=True,
-            allow_bot_chats=True,
-            allow_group_chats=True,
-            allow_channel_chats=True,
-        )
-        return web.json_response({"id": prepared.id})
-    except Exception:
-        logging.exception("prepare failed")
-        return web.json_response({"error": "fail"}, status=500)
-
-
-async def start_web(bot: Bot):
+async def start_web():
     app = web.Application()
-    app["bot"] = bot
     app.router.add_get("/", h_health)
-    app.router.add_get("/share", h_share)
-    app.router.add_post("/api/prepare", h_prepare)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
@@ -374,11 +435,26 @@ async def start_web(bot: Bot):
 
 async def main():
     global bot_username
+    await start_web()  # порт открываем сразу, чтобы Render видел сервис живым
+
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    bot_username = (await bot.get_me()).username
+    for attempt in range(10):
+        try:
+            bot_username = (await bot.get_me()).username
+            break
+        except Exception as e:
+            logging.warning("get_me failed (%s), retry", e)
+            await asyncio.sleep(3)
+    else:
+        raise RuntimeError("Не удалось подключиться к Telegram")
+
     await bot.delete_webhook(drop_pending_updates=True)
-    await start_web(bot)
-    asyncio.create_task(scheduler(bot))
+
+    spawn("rates_updater", rates_updater)
+    spawn("scheduler", scheduler, bot)
+    if PUBLIC_URL:
+        spawn("keepalive", keepalive)
+
     await dp.start_polling(
         bot, allowed_updates=["message", "inline_query", "chosen_inline_result"]
     )
